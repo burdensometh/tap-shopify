@@ -2,14 +2,14 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from graphql import parse
 import requests
 
 from tap_shopify import _is_fulfillment_scope_error, order_bulk_streams, shuffle_streams
 from tap_shopify.context import Context
-from tap_shopify.exceptions import ShopifyAPIError
+from tap_shopify.exceptions import BulkWindowConflict, ShopifyAPIError
 from tap_shopify.streams.fulfillment_orders import FulfillmentOrders
 
 
@@ -237,9 +237,9 @@ class TestFulfillmentOrdersBulk(unittest.TestCase):
             {"id": "op0", "status": "CREATED"}, {"id": "op1", "status": "CREATED"},
         ])
         self.stream.poll_bulk_completion = MagicMock(return_value=None if empty else "url")
-        self.stream.parse_bulk_jsonl = MagicMock(side_effect=[
-            iter([{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "status": "OPEN"}]),
-            iter([{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "fulfillments": []}]),
+        self.mock_parts([
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "status": "OPEN"}],
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "fulfillments": []}],
         ])
         self.stream.get_locations_for_move = MagicMock(return_value=[])
         now_patch = patch("tap_shopify.streams.fulfillment_orders.utils.now", return_value=(
@@ -247,6 +247,20 @@ class TestFulfillmentOrdersBulk(unittest.TestCase):
         ))
         now_patch.start()
         self.addCleanup(now_patch.stop)
+
+    def mock_parts(self, *attempts):
+        """Feed one payload list per bulk part, in part order, per attempt."""
+        self.stream.parse_bulk_jsonl = MagicMock(side_effect=[
+            iter(payload) for attempt in attempts for payload in attempt
+        ])
+
+    def mock_part_attempts(self, attempts):
+        """Mock a window read where each attempt retries both bulk parts."""
+        self.stream.submit_bulk_query = MagicMock(side_effect=[
+            {"id": f"op{attempt}{index}", "status": "CREATED"}
+            for attempt in range(attempts) for index in range(2)
+        ])
+        self.stream.poll_bulk_completion = MagicMock(return_value="url")
 
     def test_sync_merges_before_emitting_and_advancing_bookmark(self):
         self.mock_sync()
@@ -334,12 +348,72 @@ class TestFulfillmentOrdersBulk(unittest.TestCase):
         self.stream.submit_bulk_query.assert_called_once()
 
     def test_mismatched_roots_do_not_emit_or_advance(self):
-        self.mock_sync()
-        self.stream.parse_bulk_jsonl.side_effect = [
-            iter([{"id": "root"}]), iter([]),
-        ]
-        with self.assertRaisesRegex(ShopifyAPIError, "roots changed"):
+        attempts = self.stream.max_window_attempts
+        self.mock_part_attempts(attempts)
+        self.mock_parts(*[[[{"id": "root"}], []]] * attempts)
+        with self.assertRaisesRegex(ShopifyAPIError, "consistent snapshot"):
             list(self.stream.get_objects())
+        self.assertEqual(self.stream.submit_bulk_query.call_count, attempts * 2)
+        self.assertNotIn("updatedAt", Context.state["bookmarks"]["fulfillment_orders"])
+        self.assertNotIn("bulk_operation", Context.state["bookmarks"]["fulfillment_orders"])
+
+    def test_conflicting_versions_redo_window_then_emit_consistent_snapshot(self):
+        self.mock_part_attempts(2)
+        self.mock_parts([
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "status": "OPEN"}],
+            [{"id": "root", "updatedAt": "2026-01-01T01:30:00Z", "fulfillments": []}],
+        ], [
+            [{"id": "root", "updatedAt": "2026-01-01T02:00:00Z", "status": "OPEN"}],
+            [{"id": "root", "updatedAt": "2026-01-01T02:00:00Z", "fulfillments": []}],
+        ])
+        self.stream.get_locations_for_move = MagicMock(return_value=[])
+        with patch("tap_shopify.streams.fulfillment_orders.utils.now", return_value=(
+            datetime(2026, 1, 2, tzinfo=timezone.utc)
+        )):
+            records = list(self.stream.get_objects())
+        self.assertEqual([record["updatedAt"] for record in records], [
+            "2026-01-01T02:00:00Z",
+        ])
+        self.assertEqual(records[0]["fulfillments"], [])
+        self.assertEqual(self.stream.submit_bulk_query.call_count, 4)
+
+    def test_conflicting_shared_field_does_not_overwrite(self):
+        self.mock_part_attempts(1)
+        self.mock_parts([
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "status": "OPEN"}],
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "status": "CLOSED",
+              "fulfillments": []}],
+        ])
+        self.stream.get_locations_for_move = MagicMock(return_value=[])
+        with self.assertRaisesRegex(ShopifyAPIError, "conflicting field 'status'"):
+            list(self.stream.get_objects())
+        self.assertNotIn("updatedAt", Context.state["bookmarks"]["fulfillment_orders"])
+
+    def test_missing_part_for_one_root_redoes_window(self):
+        attempts = self.stream.max_window_attempts
+        self.mock_part_attempts(attempts)
+        self.mock_parts(*[[
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z"},
+             {"id": "other", "updatedAt": "2026-01-01T01:00:00Z"}],
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "fulfillments": []}],
+        ]] * attempts)
+        self.stream.get_locations_for_move = MagicMock(return_value=[])
+        with self.assertRaisesRegex(ShopifyAPIError, "consistent snapshot"):
+            list(self.stream.get_objects())
+        self.assertNotIn("updatedAt", Context.state["bookmarks"]["fulfillment_orders"])
+
+    def test_conflicting_shared_field_does_not_overwrite(self):
+        attempts = self.stream.max_window_attempts
+        self.mock_part_attempts(attempts)
+        self.mock_parts(*[[
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "status": "OPEN"}],
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "status": "CLOSED",
+              "fulfillments": []}],
+        ]] * attempts)
+        self.stream.get_locations_for_move = MagicMock(return_value=[])
+        with self.assertRaisesRegex(ShopifyAPIError, "consistent snapshot"):
+            list(self.stream.get_objects())
+        self.assertEqual(self.stream.submit_bulk_query.call_count, attempts * 2)
         self.assertNotIn("updatedAt", Context.state["bookmarks"]["fulfillment_orders"])
 
     def test_location_and_line_item_pagination(self):
@@ -376,6 +450,77 @@ class TestFulfillmentOrdersBulk(unittest.TestCase):
                 self.assertEqual(location[field], [{"id": "line1"}, {"id": "line2"}])
         self.assertEqual(len(requests_seen), 10)
         self.assertEqual(requests_seen[-1][1]["locationIds"], ["loc2"])
+
+    def test_location_lookup_pins_root_version(self):
+        self.stream.bulk_request = MagicMock(return_value={"fulfillmentOrder": {
+            "id": "root", "updatedAt": "2026-01-01T02:00:00Z",
+            "locationsForMove": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+        }})
+        with self.assertRaisesRegex(ShopifyAPIError, "changed during locationsForMove"):
+            self.stream.get_locations_for_move(
+                "root", expected_updated_at="2026-01-01T01:00:00Z",
+            )
+
+    def test_location_lookup_pins_root_version_on_every_page(self):
+        def fetch(query, variables):
+            updated_at = (
+                "2026-01-01T02:00:00Z" if variables.get("after")
+                else "2026-01-01T01:00:00Z"
+            )
+            return {"fulfillmentOrder": {
+                "id": "root", "updatedAt": updated_at,
+                "locationsForMove": {
+                    "nodes": [],
+                    "pageInfo": {
+                        "hasNextPage": not variables.get("after"),
+                        "endCursor": "cursor",
+                    },
+                },
+            }}
+
+        self.stream.bulk_request = MagicMock(side_effect=fetch)
+        with self.assertRaisesRegex(ShopifyAPIError, "changed during locationsForMove"):
+            self.stream.get_locations_for_move(
+                "root", expected_updated_at="2026-01-01T01:00:00Z",
+            )
+        self.assertEqual(self.stream.bulk_request.call_count, 2)
+
+    def test_location_line_items_pin_root_version(self):
+        self.stream.bulk_request = MagicMock(return_value={"fulfillmentOrder": {
+            "id": "root", "updatedAt": "2026-01-01T02:00:00Z",
+            "locationsForMove": {"nodes": [{"availableLineItems": {
+                "nodes": [], "pageInfo": {"hasNextPage": False},
+            }}]},
+        }})
+        with self.assertRaisesRegex(ShopifyAPIError, "changed during locationsForMove"):
+            self.stream.get_location_line_items(
+                "root", "loc", "availableLineItems",
+                expected_updated_at="2026-01-01T01:00:00Z",
+            )
+
+    def test_changed_root_during_backfill_redoes_window(self):
+        attempts = self.stream.max_window_attempts
+        self.mock_part_attempts(attempts)
+        self.mock_parts(*[[
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z"}],
+            [{"id": "root", "updatedAt": "2026-01-01T01:00:00Z", "fulfillments": []}],
+        ]] * attempts)
+        self.stream.get_locations_for_move = MagicMock(
+            side_effect=BulkWindowConflict("root changed")
+        )
+        with self.assertRaisesRegex(ShopifyAPIError, "consistent snapshot"):
+            list(self.stream.get_objects())
+        self.assertEqual(self.stream.get_locations_for_move.call_count, attempts)
+        self.assertNotIn("updatedAt", Context.state["bookmarks"]["fulfillment_orders"])
+        self.assertNotIn("bulk_operation", Context.state["bookmarks"]["fulfillment_orders"])
+
+    def test_location_backfill_passes_bulk_version(self):
+        self.mock_sync()
+        self.stream.get_objects().__next__()
+        self.assertEqual(
+            self.stream.get_locations_for_move.call_args,
+            call("root", expected_updated_at="2026-01-01T01:00:00Z"),
+        )
 
     def test_orders_precedes_fulfillment_with_resume_priority_preserved(self):
         with patch.object(Context, "catalog", {"streams": [
